@@ -52,32 +52,7 @@ let competitionState = {
 
 // Enable CORS for local development and production
 app.use(cors({
-    origin: function(origin, callback) {
-        // Allow requests with no origin (mobile apps, curl, Postman, file://)
-        if (!origin) return callback(null, true);
-        
-        const allowedOrigins = [
-            'http://127.0.0.1:5500',
-            'http://localhost:5500',
-            'http://127.0.0.1:8080',
-            'http://localhost:8080',
-            'http://localhost:3000',
-            process.env.FRONTEND_URL
-        ].filter(Boolean);
-        
-        // Check if origin is in allowed list
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            return callback(null, true);
-        }
-        
-        // In development mode, allow all origins for easier testing
-        if (process.env.NODE_ENV === 'development') {
-            return callback(null, true);
-        }
-        
-        // In production, block unknown origins
-        callback(new Error('Not allowed by CORS'));
-    },
+    origin: "*",
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
@@ -103,21 +78,21 @@ app.use((req, res, next) => {
  */
 function authenticateAdmin(req, res, next) {
     const apiKey = req.headers['x-api-key'];
-    
+
     if (!apiKey) {
         return res.status(401).json({
             success: false,
             message: 'Authentication required. Provide X-API-Key header.'
         });
     }
-    
+
     if (apiKey !== CONFIG.ADMIN_API_KEY) {
         return res.status(403).json({
             success: false,
             message: 'Invalid API key. Access denied.'
         });
     }
-    
+
     // API key is valid, proceed
     next();
 }
@@ -133,11 +108,11 @@ function authenticateAdmin(req, res, next) {
  */
 function calculateRemainingSeconds(endTimeISO) {
     if (!endTimeISO) return 0;
-    
+
     const now = new Date().getTime();
     const end = new Date(endTimeISO).getTime();
     const diffMs = end - now;
-    
+
     return Math.max(0, Math.floor(diffMs / 1000));
 }
 
@@ -147,9 +122,9 @@ function calculateRemainingSeconds(endTimeISO) {
  */
 function checkAndUpdateCompetitionStatus() {
     if (!competitionState.isActive) return;
-    
+
     const remaining = calculateRemainingSeconds(competitionState.endTime);
-    
+
     if (remaining === 0 && !competitionState.isEnded) {
         competitionState.isEnded = true;
         competitionState.isActive = false;
@@ -168,29 +143,29 @@ function getCompetitionDateRange() {
     if (competitionState.isActive && competitionState.startTime && competitionState.endTime) {
         const now = new Date();
         const competitionEnd = new Date(competitionState.endTime);
-        
+
         // CRITICAL: Use the earlier of "right now" OR "competition end"
         // This ensures we never query for future data
         const effectiveTo = now < competitionEnd ? now : competitionEnd;
-        
+
         console.log('📅 Active competition:');
         console.log(`   From: ${competitionState.startTime} (start)`);
         console.log(`   To: ${effectiveTo.toISOString()} (${now < competitionEnd ? 'now' : 'end'})`);
-        
+
         return {
             from: competitionState.startTime,       // Fixed: competition start
             to: effectiveTo.toISOString()          // Dynamic: now (or end if over)
         };
     }
-    
+
     // No active competition: show last 30 days by default
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
-    
+
     console.log('📅 No active competition - showing last 30 days');
     console.log(`   From: ${thirtyDaysAgo.toISOString()}`);
     console.log(`   To: ${now.toISOString()}`);
-    
+
     return {
         from: thirtyDaysAgo.toISOString(),  // 30 days ago
         to: now.toISOString()               // Right now
@@ -209,10 +184,10 @@ app.get('/api/leaderboard', async (req, res) => {
     try {
         // Update competition status before fetching
         checkAndUpdateCompetitionStatus();
-        
+
         // Get current competition date range
         const { from, to } = getCompetitionDateRange();
-        
+
         // Build external API URL
         const apiUrl = `${CONFIG.EXTERNAL_API_BASE}` +
             `?token=${CONFIG.EXTERNAL_API_TOKEN}` +
@@ -221,10 +196,10 @@ app.get('/api/leaderboard', async (req, res) => {
             `&order=DESC` +
             `&from=${from}` +
             `&to=${to}`;
-        
+
         console.log(`📊 Fetching leaderboard data`);
         console.log(`   URL: ${apiUrl}`);
-        
+
         // Fetch data from external API
         const response = await axios.get(apiUrl, {
             timeout: 10000, // 10 second timeout
@@ -232,9 +207,9 @@ app.get('/api/leaderboard', async (req, res) => {
                 'User-Agent': 'Leaderboard-Backend/1.0'
             }
         });
-        
+
         console.log(`✅ External API responded with ${response.data?.list?.length || 0} players`);
-        
+
         // Return proxied data with additional metadata
         res.json({
             success: true,
@@ -248,10 +223,10 @@ app.get('/api/leaderboard', async (req, res) => {
             },
             fetchedAt: new Date().toISOString()
         });
-        
+
     } catch (error) {
         console.error('❌ Error fetching leaderboard:', error.message);
-        
+
         // Handle different error types
         if (error.code === 'ECONNABORTED') {
             return res.status(504).json({
@@ -259,11 +234,11 @@ app.get('/api/leaderboard', async (req, res) => {
                 message: 'External API request timed out. Please try again.'
             });
         }
-        
+
         if (error.response) {
             // External API returned an error
             console.error('External API error details:', error.response.data);
-            
+
             return res.status(502).json({
                 success: false,
                 message: 'External API error. Please try again later.',
@@ -273,7 +248,7 @@ app.get('/api/leaderboard', async (req, res) => {
                 })
             });
         }
-        
+
         // Generic error
         res.status(500).json({
             success: false,
@@ -289,7 +264,7 @@ app.get('/api/leaderboard', async (req, res) => {
  */
 app.get('/api/status', (req, res) => {
     checkAndUpdateCompetitionStatus();
-    
+
     res.json({
         success: true,
         competition: {
@@ -317,7 +292,7 @@ app.get('/api/status', (req, res) => {
 app.post('/api/admin/start', authenticateAdmin, (req, res) => {
     try {
         checkAndUpdateCompetitionStatus();
-        
+
         // Prevent starting if already active
         if (competitionState.isActive && !competitionState.isEnded) {
             return res.status(400).json({
@@ -330,10 +305,10 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
                 }
             });
         }
-        
+
         // Get duration from request or use default
         const durationDays = req.body.durationDays || CONFIG.COMPETITION_DURATION_DAYS;
-        
+
         // Validate duration
         if (durationDays < 1 || durationDays > 365) {
             return res.status(400).json({
@@ -341,11 +316,11 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
                 message: 'Duration must be between 1 and 365 days'
             });
         }
-        
+
         // Calculate timestamps
         const now = new Date();
         const endTime = new Date(now.getTime() + (durationDays * 24 * 60 * 60 * 1000));
-        
+
         // Update state
         competitionState = {
             isActive: true,
@@ -355,11 +330,11 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
             createdAt: now.toISOString(),
             durationDays
         };
-        
+
         console.log(`🚀 Competition started: ${durationDays} days`);
         console.log(`   Start: ${competitionState.startTime}`);
         console.log(`   End:   ${competitionState.endTime}`);
-        
+
         res.json({
             success: true,
             message: `Competition started successfully (${durationDays} days)`,
@@ -368,7 +343,7 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
                 remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
             }
         });
-        
+
     } catch (error) {
         console.error('❌ Error starting competition:', error);
         res.status(500).json({
@@ -387,7 +362,7 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
 app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
     try {
         const previousState = { ...competitionState };
-        
+
         // Reset state
         competitionState = {
             isActive: false,
@@ -396,16 +371,16 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
             isEnded: false,
             createdAt: null
         };
-        
+
         console.log('🔄 Competition reset');
-        
+
         res.json({
             success: true,
             message: 'Competition reset successfully',
             previousState,
             newState: competitionState
         });
-        
+
     } catch (error) {
         console.error('❌ Error resetting competition:', error);
         res.status(500).json({
@@ -423,9 +398,9 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
  */
 app.get('/api/admin/status', authenticateAdmin, (req, res) => {
     checkAndUpdateCompetitionStatus();
-    
+
     const remaining = calculateRemainingSeconds(competitionState.endTime);
-    
+
     res.json({
         success: true,
         competition: {
@@ -478,7 +453,7 @@ app.use((req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err);
-    
+
     res.status(err.status || 500).json({
         success: false,
         message: 'Internal server error',
@@ -517,7 +492,7 @@ app.listen(PORT, () => {
 ⚠️  Note: Using in-memory storage. State will reset on server restart.
     For production, integrate a database or Redis.
     `);
-    
+
     // Warn if using default API key
     if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
         console.log(`
