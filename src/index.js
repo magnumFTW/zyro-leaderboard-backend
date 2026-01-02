@@ -208,6 +208,15 @@ app.get('/api/leaderboard', async (req, res) => {
             }
         });
 
+            // Sort the list by wagered amount in descending order
+        if (response.data && response.data.list) {
+            response.data.list.sort((a, b) => {
+                const wageredA = parseFloat(a.wagered || 0);
+                const wageredB = parseFloat(b.wagered || 0);
+                return wageredB - wageredA; // Descending order (highest first)
+            });
+        }
+        
         console.log(`✅ External API responded with ${response.data?.list?.length || 0} players`);
 
         // Return proxied data with additional metadata
