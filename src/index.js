@@ -23,6 +23,21 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const redis = require('redis');
+
+// Create Redis client
+const redisClient = redis.createClient({
+    url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+
+// Connect to Redis
+(async () => {
+    await redisClient.connect();
+    console.log('✅ Connected to Redis');
+})();
+
 // ===================================================================
 // # CONFIGURATION
 // ===================================================================
@@ -37,14 +52,55 @@ const CONFIG = {
 // ===================================================================
 // # IN-MEMORY STATE STORAGE
 // ===================================================================
-// In production, replace this with Redis or a database
-let competitionState = {
-    isActive: false,
-    startTime: null,      // ISO 8601 timestamp
-    endTime: null,        // ISO 8601 timestamp
-    isEnded: false,
-    createdAt: null
+// Redis key prefixes
+const REDIS_KEYS = {
+    COMPETITION_STATE: 'competition:state',
+    PLAYER_INITIAL_WAGERS: 'competition:initial_wagers' // Hash: username -> initial wagered
 };
+
+// Get competition state from Redis
+async function getCompetitionState() {
+    const state = await redisClient.get(REDIS_KEYS.COMPETITION_STATE);
+    return state ? JSON.parse(state) : {
+        isActive: false,
+        startTime: null,
+        endTime: null,
+        isEnded: false,
+        createdAt: null
+    };
+}
+
+// Save competition state to Redis
+async function saveCompetitionState(state) {
+    await redisClient.set(REDIS_KEYS.COMPETITION_STATE, JSON.stringify(state));
+}
+
+// Store initial wagered amounts when competition starts
+async function storeInitialWagers(playersList) {
+    const pipeline = redisClient.multi();
+    
+    for (const player of playersList) {
+        pipeline.hSet(
+            REDIS_KEYS.PLAYER_INITIAL_WAGERS,
+            player.username,
+            player.wagered.toString()
+        );
+    }
+    
+    await pipeline.exec();
+    console.log(`📦 Stored initial wagers for ${playersList.length} players`);
+}
+
+// Get player's initial wagered amount
+async function getInitialWager(username) {
+    const value = await redisClient.hGet(REDIS_KEYS.PLAYER_INITIAL_WAGERS, username);
+    return value ? parseFloat(value) : 0;
+}
+
+// Clear all initial wagers (on reset)
+async function clearInitialWagers() {
+    await redisClient.del(REDIS_KEYS.PLAYER_INITIAL_WAGERS);
+}
 
 // ===================================================================
 // # MIDDLEWARE
@@ -120,7 +176,8 @@ function calculateRemainingSeconds(endTimeISO) {
  * Check if competition should be marked as ended
  * Updates state if competition time has expired
  */
-function checkAndUpdateCompetitionStatus() {
+async function checkAndUpdateCompetitionStatus() {
+    const competitionState = await getCompetitionState();
     if (!competitionState.isActive) return;
 
     const remaining = calculateRemainingSeconds(competitionState.endTime);
@@ -128,6 +185,7 @@ function checkAndUpdateCompetitionStatus() {
     if (remaining === 0 && !competitionState.isEnded) {
         competitionState.isEnded = true;
         competitionState.isActive = false;
+        await saveCompetitionState(competitionState);
         console.log('🏁 Competition has ended automatically');
     }
 }
@@ -138,14 +196,12 @@ function checkAndUpdateCompetitionStatus() {
  * For inactive: rolling 30-day window
  * @returns {object} { from: ISO_DATE, to: ISO_DATE }
  */
-function getCompetitionDateRange() {
-    // If competition is active, use its date range
+async function getCompetitionDateRange() {
+    const competitionState = await getCompetitionState();
+    
     if (competitionState.isActive && competitionState.startTime && competitionState.endTime) {
         const now = new Date();
         const competitionEnd = new Date(competitionState.endTime);
-
-        // CRITICAL: Use the earlier of "right now" OR "competition end"
-        // This ensures we never query for future data
         const effectiveTo = now < competitionEnd ? now : competitionEnd;
 
         console.log('📅 Active competition:');
@@ -153,22 +209,18 @@ function getCompetitionDateRange() {
         console.log(`   To: ${effectiveTo.toISOString()} (${now < competitionEnd ? 'now' : 'end'})`);
 
         return {
-            from: competitionState.startTime,       // Fixed: competition start
-            to: effectiveTo.toISOString()          // Dynamic: now (or end if over)
+            from: competitionState.startTime,
+            to: effectiveTo.toISOString()
         };
     }
 
-    // No active competition: show last 30 days by default
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
 
     console.log('📅 No active competition - showing last 30 days');
-    console.log(`   From: ${thirtyDaysAgo.toISOString()}`);
-    console.log(`   To: ${now.toISOString()}`);
-
     return {
-        from: thirtyDaysAgo.toISOString(),  // 30 days ago
-        to: now.toISOString()               // Right now
+        from: thirtyDaysAgo.toISOString(),
+        to: now.toISOString()
     };
 }
 
@@ -182,13 +234,11 @@ function getCompetitionDateRange() {
  */
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        // Update competition status before fetching
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
+        const competitionState = await getCompetitionState();
 
-        // Get current competition date range
-        const { from, to } = getCompetitionDateRange();
+        const { from, to } = await getCompetitionDateRange();
 
-        // Build external API URL
         const apiUrl = `${CONFIG.EXTERNAL_API_BASE}` +
             `?token=${CONFIG.EXTERNAL_API_TOKEN}` +
             `&skip=0` +
@@ -198,28 +248,30 @@ app.get('/api/leaderboard', async (req, res) => {
             `&to=${to}`;
 
         console.log(`📊 Fetching leaderboard data`);
-        console.log(`   URL: ${apiUrl}`);
 
-        // Fetch data from external API
         const response = await axios.get(apiUrl, {
-            timeout: 10000, // 10 second timeout
-            headers: {
-                'User-Agent': 'Leaderboard-Backend/1.0'
-            }
+            timeout: 10000,
+            headers: { 'User-Agent': 'Leaderboard-Backend/1.0' }
         });
 
-            // Sort the list by wagered amount in descending order
-        if (response.data && response.data.list) {
-            response.data.list.sort((a, b) => {
-                const wageredA = parseFloat(a.wagered || 0);
-                const wageredB = parseFloat(b.wagered || 0);
-                return wageredB - wageredA; // Descending order (highest first)
-            });
+        // **KEY CHANGE**: Subtract initial wagers if competition is active
+        if (competitionState.isActive && response.data && response.data.list) {
+            for (const player of response.data.list) {
+                const initialWager = await getInitialWager(player.username);
+                const currentWager = parseFloat(player.wagered || 0);
+                
+                // Show only wagered DURING competition
+                player.wagered = Math.max(0, currentWager - initialWager).toString();
+            }
         }
-        
+
+        // Sort by wagered amount
+        if (response.data && response.data.list) {
+            response.data.list.sort((a, b) => parseFloat(b.wagered || 0) - parseFloat(a.wagered || 0));
+        }
+
         console.log(`✅ External API responded with ${response.data?.list?.length || 0} players`);
 
-        // Return proxied data with additional metadata
         res.json({
             success: true,
             data: response.data,
@@ -271,8 +323,9 @@ app.get('/api/leaderboard', async (req, res) => {
  * GET /api/status
  * Public endpoint - returns competition status without admin auth
  */
-app.get('/api/status', (req, res) => {
-    checkAndUpdateCompetitionStatus();
+app.get('/api/status', async (req, res) => {
+    await checkAndUpdateCompetitionStatus();
+    const competitionState = await getCompetitionState();
 
     res.json({
         success: true,
@@ -298,27 +351,20 @@ app.get('/api/status', (req, res) => {
  * Requires: X-API-Key header
  * Body (optional): { durationDays: number }
  */
-app.post('/api/admin/start', authenticateAdmin, (req, res) => {
+app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
     try {
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
+        const competitionState = await getCompetitionState();
 
-        // Prevent starting if already active
         if (competitionState.isActive && !competitionState.isEnded) {
             return res.status(400).json({
                 success: false,
-                message: 'Competition is already active',
-                currentState: {
-                    startTime: competitionState.startTime,
-                    endTime: competitionState.endTime,
-                    remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
-                }
+                message: 'Competition is already active'
             });
         }
 
-        // Get duration from request or use default
         const durationDays = req.body.durationDays || CONFIG.COMPETITION_DURATION_DAYS;
 
-        // Validate duration
         if (durationDays < 1 || durationDays > 365) {
             return res.status(400).json({
                 success: false,
@@ -326,12 +372,10 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
             });
         }
 
-        // Calculate timestamps
         const now = new Date();
         const endTime = new Date(now.getTime() + (durationDays * 24 * 60 * 60 * 1000));
 
-        // Update state
-        competitionState = {
+        const newState = {
             isActive: true,
             startTime: now.toISOString(),
             endTime: endTime.toISOString(),
@@ -340,16 +384,29 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
             durationDays
         };
 
+        await saveCompetitionState(newState);
+
+        // **KEY ADDITION**: Fetch current leaderboard and store initial wagers
+        const { from, to } = await getCompetitionDateRange();
+        const apiUrl = `${CONFIG.EXTERNAL_API_BASE}?token=${CONFIG.EXTERNAL_API_TOKEN}&skip=0&take=${CONFIG.MAX_RECORDS_PER_REQUEST}&order=DESC&from=${from}&to=${to}`;
+        
+        try {
+            const response = await axios.get(apiUrl, { timeout: 10000 });
+            if (response.data && response.data.list) {
+                await storeInitialWagers(response.data.list);
+            }
+        } catch (err) {
+            console.error('⚠️ Failed to store initial wagers:', err.message);
+        }
+
         console.log(`🚀 Competition started: ${durationDays} days`);
-        console.log(`   Start: ${competitionState.startTime}`);
-        console.log(`   End:   ${competitionState.endTime}`);
 
         res.json({
             success: true,
             message: `Competition started successfully (${durationDays} days)`,
             competition: {
-                ...competitionState,
-                remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
+                ...newState,
+                remainingSeconds: calculateRemainingSeconds(newState.endTime)
             }
         });
 
@@ -357,8 +414,7 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
         console.error('❌ Error starting competition:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to start competition',
-            error: error.message
+            message: 'Failed to start competition'
         });
     }
 });
@@ -368,12 +424,11 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
  * Resets the competition timer
  * Requires: X-API-Key header
  */
-app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
+app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
     try {
-        const previousState = { ...competitionState };
+        const previousState = await getCompetitionState();
 
-        // Reset state
-        competitionState = {
+        const newState = {
             isActive: false,
             startTime: null,
             endTime: null,
@@ -381,21 +436,23 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
             createdAt: null
         };
 
+        await saveCompetitionState(newState);
+        await clearInitialWagers(); // Clear stored initial wagers
+
         console.log('🔄 Competition reset');
 
         res.json({
             success: true,
             message: 'Competition reset successfully',
             previousState,
-            newState: competitionState
+            newState
         });
 
     } catch (error) {
         console.error('❌ Error resetting competition:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to reset competition',
-            error: error.message
+            message: 'Failed to reset competition'
         });
     }
 });
@@ -405,8 +462,9 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
  * Returns detailed competition status (admin view)
  * Requires: X-API-Key header
  */
-app.get('/api/admin/status', authenticateAdmin, (req, res) => {
-    checkAndUpdateCompetitionStatus();
+app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
+    await checkAndUpdateCompetitionStatus();
+    const competitionState = await getCompetitionState();
 
     const remaining = calculateRemainingSeconds(competitionState.endTime);
 
@@ -474,7 +532,9 @@ app.use((err, req, res, next) => {
 // # START SERVER
 // ===================================================================
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+    const competitionState = await getCompetitionState();
+    
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
@@ -498,8 +558,7 @@ app.listen(PORT, () => {
    Duration: ${CONFIG.COMPETITION_DURATION_DAYS} days
    State: ${competitionState.isActive ? '🟢 ACTIVE' : '⚪ INACTIVE'}
 
-⚠️  Note: Using in-memory storage. State will reset on server restart.
-    For production, integrate a database or Redis.
+✅ Using Redis for persistent storage.
     `);
 
     // Warn if using default API key
@@ -520,9 +579,11 @@ Generate a secure key:
 // ===================================================================
 
 // Automatically check if competition should end every minute
-setInterval(() => {
+// Automatically check if competition should end every minute
+setInterval(async () => {
+    const competitionState = await getCompetitionState();
     if (competitionState.isActive) {
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
     }
 }, 60000); // Check every 60 seconds
 
