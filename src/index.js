@@ -77,24 +77,56 @@ async function saveCompetitionState(state) {
 
 // Store initial wagered amounts when competition starts
 async function storeInitialWagers(playersList) {
-    const pipeline = redisClient.multi();
-    
-    for (const player of playersList) {
-        pipeline.hSet(
-            REDIS_KEYS.PLAYER_INITIAL_WAGERS,
-            player.username,
-            player.wagered.toString()
-        );
+    try {
+        if (!playersList || playersList.length === 0) {
+            console.log('⚠️ No players to store initial wagers for');
+            return;
+        }
+
+        let stored = 0;
+        for (const player of playersList) {
+            try {
+                // Skip if player data is invalid
+                if (!player || !player.username) {
+                    continue;
+                }
+                
+                // Default to "0" if wagered is null/undefined
+                const wageredValue = player.wagered != null ? player.wagered.toString() : "0";
+                
+                await redisClient.hSet(
+                    REDIS_KEYS.PLAYER_INITIAL_WAGERS,
+                    player.username,
+                    wageredValue
+                );
+                stored++;
+            } catch (err) {
+                console.error(`Failed to store wager for ${player.username}:`, err.message);
+            }
+        }
+        
+        console.log(`📦 Stored initial wagers for ${stored} players`);
+    } catch (error) {
+        console.error('❌ Error in storeInitialWagers:', error);
     }
-    
-    await pipeline.exec();
-    console.log(`📦 Stored initial wagers for ${playersList.length} players`);
 }
 
 // Get player's initial wagered amount
 async function getInitialWager(username) {
-    const value = await redisClient.hGet(REDIS_KEYS.PLAYER_INITIAL_WAGERS, username);
-    return value ? parseFloat(value) : 0;
+    try {
+        if (!username) return 0;
+        
+        const value = await redisClient.hGet(REDIS_KEYS.PLAYER_INITIAL_WAGERS, username);
+        
+        // Return 0 if value is null/undefined or can't be parsed
+        if (value == null || value === '') return 0;
+        
+        const parsed = parseFloat(value);
+        return isNaN(parsed) ? 0 : parsed;
+    } catch (error) {
+        console.error(`Error getting initial wager for ${username}:`, error.message);
+        return 0;
+    }
 }
 
 // Clear all initial wagers (on reset)
