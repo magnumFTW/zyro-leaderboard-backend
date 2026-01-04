@@ -376,7 +376,7 @@ app.get('/api/status', async (req, res) => {
             startTime: competitionState.startTime,
             endTime: competitionState.endTime,
             remainingSeconds: calculateRemainingSeconds(competitionState.endTime),
-            durationDays: CONFIG.COMPETITION_DURATION_DAYS
+            durationDays: competitionState.durationDays || CONFIG.COMPETITION_DURATION_DAYS
         },
         serverTime: new Date().toISOString()
     });
