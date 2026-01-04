@@ -385,6 +385,13 @@ app.get('/api/status', async (req, res) => {
  */
 app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
     try {
+
+        // ADD THESE DEBUG LINES:
+        console.log('📥 Received request body:', req.body);
+        console.log('📥 Duration from body:', req.body.durationDays);
+        console.log('📥 Type of durationDays:', typeof req.body.durationDays);
+
+
         await checkAndUpdateCompetitionStatus();
         const competitionState = await getCompetitionState();
 
@@ -396,6 +403,9 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
         }
 
         const durationDays = req.body.durationDays || CONFIG.COMPETITION_DURATION_DAYS;
+
+        // ADD THIS TOO:
+        console.log('📊 Final durationDays value:', durationDays);
 
         if (durationDays < 1 || durationDays > 365) {
             return res.status(400).json({
