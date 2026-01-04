@@ -61,13 +61,22 @@ const REDIS_KEYS = {
 // Get competition state from Redis
 async function getCompetitionState() {
     const state = await redisClient.get(REDIS_KEYS.COMPETITION_STATE);
-    return state ? JSON.parse(state) : {
+    
+    // DEBUG: Log what Redis returned
+    console.log('🔍 Raw data from Redis:', state);
+    
+    const parsed = state ? JSON.parse(state) : {
         isActive: false,
         startTime: null,
         endTime: null,
         isEnded: false,
         createdAt: null
     };
+    
+    // DEBUG: Log parsed data
+    console.log('🔍 Parsed state:', parsed);
+    
+    return parsed;
 }
 
 // Save competition state to Redis
