@@ -448,6 +448,8 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
             console.error('⚠️ Failed to store initial wagers:', err.message);
         }
 
+        console.log('🔍🔍🔍 DEBUG: durationDays =', durationDays);
+        console.log('🔍🔍🔍 DEBUG: newState =', JSON.stringify(newState));
         console.log(`🚀 Competition started: ${durationDays} days`);
 
         res.json({
