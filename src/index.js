@@ -404,8 +404,9 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
 
         const durationDays = req.body.durationDays || CONFIG.COMPETITION_DURATION_DAYS;
 
-        // ADD THIS TOO:
-        console.log('📊 Final durationDays value:', durationDays);
+        // ADD THIS RIGHT AFTER:
+        console.log('🔍 durationDays value:', durationDays);
+        console.log('🔍 Type:', typeof durationDays);
 
         if (durationDays < 1 || durationDays > 365) {
             return res.status(400).json({
@@ -425,6 +426,12 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
             createdAt: now.toISOString(),
             durationDays: durationDays
         };
+
+        // Add this debug log right after:
+        console.log('💾 Saving state to Redis:', newState);
+
+        // ADD THIS RIGHT AFTER:
+        onsole.log('💾 newState object:', JSON.stringify(newState, null, 2));
 
         await saveCompetitionState(newState);
 
