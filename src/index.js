@@ -431,7 +431,7 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
         console.log('💾 Saving state to Redis:', newState);
 
         // ADD THIS RIGHT AFTER:
-        onsole.log('💾 newState object:', JSON.stringify(newState, null, 2));
+        console.log('💾 newState object:', JSON.stringify(newState, null, 2));
 
         await saveCompetitionState(newState);
 
