@@ -423,7 +423,7 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
             endTime: endTime.toISOString(),
             isEnded: false,
             createdAt: now.toISOString(),
-            durationDays
+            durationDays: durationDays
         };
 
         await saveCompetitionState(newState);
