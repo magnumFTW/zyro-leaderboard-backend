@@ -179,20 +179,36 @@ async function loadCompetitionState() {
 
 // Internal save function (assumes lock is already held)
 async function _saveToRedis(state) {
-    try {
-        if (!redisClient || !redisConnected) {
-            console.log('⚠️  Redis not available - state will not persist');
+    const maxRetries = 3;
+    let lastError = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            if (!redisClient || !redisConnected) {
+                console.log('⚠️  Redis not available - state will not persist');
+                return false; // Changed to false to indicate persistence failed
+            }
+            
+            const stateJson = JSON.stringify(state);
+            await redisClient.set(CONFIG.REDIS_KEY, stateJson);
+            console.log(`✅ Competition state saved to Redis (attempt ${attempt}/${maxRetries})`);
             return true;
+        } catch (error) {
+            lastError = error;
+            console.error(`❌ Error saving state to Redis (attempt ${attempt}/${maxRetries}):`, error.message);
+            
+            if (attempt < maxRetries) {
+                // Wait before retry (exponential backoff)
+                const waitMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+                console.log(`   Retrying in ${waitMs}ms...`);
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+            }
         }
-        
-        const stateJson = JSON.stringify(state);
-        await redisClient.set(CONFIG.REDIS_KEY, stateJson);
-        console.log('✅ Competition state saved to Redis');
-        return true;
-    } catch (error) {
-        console.error('❌ Error saving state to Redis:', error);
-        return false;
     }
+    
+    console.error(`❌ CRITICAL: Failed to save to Redis after ${maxRetries} attempts`);
+    console.error(`   Last error:`, lastError?.message);
+    return false;
 }
 
 // Save competition state to Redis with lock (public API)
@@ -211,14 +227,43 @@ function getCompetitionState() {
     return { ...competitionState };
 }
 
-// NEW: Update state safely
-async function updateCompetitionState(updates) {
+// NEW: Update state safely (supports both partial updates and full replacement)
+async function updateCompetitionState(updates, isFullReplacement = false) {
     await acquireLock();
 
     try {
-        competitionState = { ...competitionState, ...updates };
-        // Use internal save (we already have the lock)
-        await _saveToRedis(competitionState);
+        if (isFullReplacement) {
+            // Complete replacement (for start/reset)
+            competitionState = { ...updates };
+        } else {
+            // Partial update (for status changes)
+            competitionState = { ...competitionState, ...updates };
+        }
+        
+        // Save to Redis
+        const saved = await _saveToRedis(competitionState);
+        
+        if (!saved) {
+            console.error('⚠️  WARNING: State updated in memory but Redis save failed!');
+            console.error('   State will be lost on server restart');
+        }
+        
+        // Verify the save by reading back (only if Redis is available)
+        if (redisClient && redisConnected) {
+            const verifyJson = await redisClient.get(CONFIG.REDIS_KEY);
+            if (verifyJson) {
+                const verifyState = JSON.parse(verifyJson);
+                console.log('✅ State verified in Redis:', {
+                    isActive: verifyState.isActive,
+                    startTime: verifyState.startTime,
+                    endTime: verifyState.endTime
+                });
+            } else {
+                console.error('❌ CRITICAL: State verification failed - nothing in Redis!');
+                return false;
+            }
+        }
+        
         return true;
     } catch (error) {
         console.error('❌ Error in updateCompetitionState:', error);
@@ -586,16 +631,20 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
             durationDays
         };
         
-        const success = await updateCompetitionState(newState);
+        console.log('🚀 Attempting to start competition:', newState);
+        
+        // Use full replacement mode
+        const success = await updateCompetitionState(newState, true);
         
         if (!success) {
+            console.error('❌ CRITICAL: Failed to save competition state to Redis!');
             return res.status(500).json({
                 success: false,
-                message: 'Failed to save competition state'
+                message: 'Failed to save competition state - Redis error. Check logs.'
             });
         }
         
-        console.log(`🚀 Competition started: ${durationDays} days`);
+        console.log(`✅ Competition started successfully: ${durationDays} days`);
         console.log(`   Start: ${newState.startTime}`);
         console.log(`   End:   ${newState.endTime}`);
         
@@ -622,16 +671,20 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
     try {
         const previousState = getCompetitionState();
         
-        const success = await updateCompetitionState(getDefaultState());
+        console.log('🔄 Attempting to reset competition...');
+        
+        // Use full replacement mode
+        const success = await updateCompetitionState(getDefaultState(), true);
         
         if (!success) {
+            console.error('❌ CRITICAL: Failed to save reset state to Redis!');
             return res.status(500).json({
                 success: false,
-                message: 'Failed to save reset state'
+                message: 'Failed to save reset state - Redis error. Check logs.'
             });
         }
         
-        console.log('🔄 Competition reset - all state cleared');
+        console.log('✅ Competition reset successfully - all state cleared');
         
         res.json({
             success: true,
@@ -654,6 +707,21 @@ app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
     const state = getCompetitionState();
     const remaining = calculateRemainingSeconds(state.endTime);
     
+    // Also check what's actually in Redis
+    let redisState = null;
+    let redisError = null;
+    
+    if (redisClient && redisConnected) {
+        try {
+            const redisJson = await redisClient.get(CONFIG.REDIS_KEY);
+            if (redisJson) {
+                redisState = JSON.parse(redisJson);
+            }
+        } catch (error) {
+            redisError = error.message;
+        }
+    }
+    
     res.json({
         success: true,
         competition: {
@@ -665,6 +733,13 @@ app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
             remainingSeconds: remaining,
             remainingDays: Math.ceil(remaining / 86400),
             durationDays: state.durationDays || CONFIG.COMPETITION_DURATION_DAYS
+        },
+        debug: {
+            inMemoryState: state,
+            redisState: redisState,
+            redisConnected: redisConnected,
+            redisError: redisError,
+            statesMatch: JSON.stringify(state) === JSON.stringify(redisState)
         },
         serverTime: new Date().toISOString(),
         uptime: process.uptime()
@@ -682,7 +757,7 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.8-lock-fixed',
+        version: '1.0.9-redis-verified',
         redis: redisConnected ? 'connected' : 'not-connected',
         storage: redisConnected ? 'persistent' : 'in-memory-only',
         serverReady,
