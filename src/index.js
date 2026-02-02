@@ -1,16 +1,14 @@
 /* ===================================================================
- * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT VERSION WITH REDIS KV
+ * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT WITH STANDARD REDIS
  * 
- * FIXED: CORS configured for Vercel deployment
- * FIXED: durationDays bug in /api/status endpoint
- * ADDED: Redis KV for persistent competition state
+ * FIXED: Uses standard Redis instead of Vercel KV
  * ================================================================ */
 
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { kv } = require('@vercel/kv');
+const { createClient } = require('redis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,14 +26,65 @@ const CONFIG = {
 };
 
 // ===================================================================
-// # REDIS KV STATE MANAGEMENT
+// # REDIS CLIENT SETUP
+// ===================================================================
+let redisClient = null;
+let redisConnected = false;
+
+async function initRedis() {
+    try {
+        // Check if Redis URL is configured (Vercel sets REDIS_URL automatically)
+        const redisUrl = process.env.REDIS_URL;
+        
+        if (!redisUrl) {
+            console.log('⚠️  Redis not configured - using in-memory storage only');
+            console.log('   Set REDIS_URL environment variable to enable persistence');
+            return null;
+        }
+
+        console.log('🔄 Connecting to Redis...');
+        redisClient = createClient({
+            url: redisUrl,
+            socket: {
+                tls: true,
+                rejectUnauthorized: false
+            }
+        });
+
+        redisClient.on('error', (err) => {
+            console.error('❌ Redis Client Error:', err);
+            redisConnected = false;
+        });
+
+        redisClient.on('connect', () => {
+            console.log('✅ Redis connected');
+            redisConnected = true;
+        });
+
+        await redisClient.connect();
+        return redisClient;
+    } catch (error) {
+        console.error('❌ Failed to connect to Redis:', error);
+        return null;
+    }
+}
+
+// ===================================================================
+// # REDIS STATE MANAGEMENT
 // ===================================================================
 
 // Load competition state from Redis
 async function loadCompetitionState() {
     try {
-        const state = await kv.get(CONFIG.REDIS_KEY);
-        if (state) {
+        if (!redisClient || !redisConnected) {
+            console.log('⚠️  Redis not available - using in-memory storage only');
+            return getDefaultState();
+        }
+        
+        const stateJson = await redisClient.get(CONFIG.REDIS_KEY);
+        
+        if (stateJson) {
+            const state = JSON.parse(stateJson);
             console.log('✅ Competition state loaded from Redis:', JSON.stringify(state, null, 2));
             
             // Validate the loaded state
@@ -53,10 +102,12 @@ async function loadCompetitionState() {
             
             return state;
         }
+        
         console.log('ℹ️  No competition state found in Redis, using default');
         return getDefaultState();
     } catch (error) {
         console.error('❌ Error loading state from Redis:', error);
+        console.log('⚠️  Falling back to in-memory storage only');
         return getDefaultState();
     }
 }
@@ -64,11 +115,18 @@ async function loadCompetitionState() {
 // Save competition state to Redis
 async function saveCompetitionState(state) {
     try {
-        await kv.set(CONFIG.REDIS_KEY, state);
+        if (!redisClient || !redisConnected) {
+            console.log('⚠️  Redis not available - state will not persist across restarts');
+            return true;
+        }
+        
+        const stateJson = JSON.stringify(state);
+        await redisClient.set(CONFIG.REDIS_KEY, stateJson);
         console.log('✅ Competition state saved to Redis');
         return true;
     } catch (error) {
         console.error('❌ Error saving state to Redis:', error);
+        console.log('⚠️  Falling back to in-memory storage only');
         return false;
     }
 }
@@ -456,8 +514,9 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.4-vercel-redis',
-        redis: 'connected'
+        version: '1.0.5-standard-redis',
+        redis: redisConnected ? 'connected' : 'not-connected',
+        storage: redisConnected ? 'persistent' : 'in-memory-only'
     });
 });
 
@@ -488,8 +547,11 @@ app.use((err, req, res, next) => {
 // ===================================================================
 
 async function startServer() {
+    // Initialize Redis connection
+    await initRedis();
+    
     // Load competition state from Redis BEFORE starting server
-    console.log('🔄 Loading competition state from Redis...');
+    console.log('🔄 Loading competition state from storage...');
     competitionState = await loadCompetitionState();
     console.log('✅ Competition state loaded:', competitionState);
 
@@ -497,7 +559,7 @@ async function startServer() {
         console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
-║              (VERCEL DEPLOYMENT + REDIS KV)                ║
+║              (VERCEL DEPLOYMENT + REDIS)                   ║
 ╚════════════════════════════════════════════════════════════╝
 
 🌐 Server:     http://localhost:${PORT}
@@ -505,7 +567,7 @@ async function startServer() {
 📊 API:        ${CONFIG.EXTERNAL_API_BASE}
 📝 Max Records: ${CONFIG.MAX_RECORDS_PER_REQUEST} per request
 🌍 Environment: ${process.env.VERCEL ? 'Vercel' : 'Local'}
-💾 Storage:     Redis KV (persistent)
+💾 Storage:     ${redisConnected ? 'Redis (persistent)' : 'In-memory (not persistent)'}
 
 📝 PUBLIC ENDPOINTS:
    GET  /api/leaderboard          - Fetch leaderboard data
@@ -525,7 +587,7 @@ ${competitionState.isActive ? `   Started: ${competitionState.startTime}
    Duration: ${competitionState.durationDays} days` : ''}
 
 ✨ CORS: Enabled for all origins on Vercel
-💾 Redis: Competition state persists across deployments
+💾 Redis: ${redisConnected ? 'Competition state persists across deployments' : 'Using in-memory storage (set REDIS_URL to enable persistence)'}
     `);
         
         if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
@@ -563,12 +625,18 @@ startServer().catch(error => {
 // # GRACEFUL SHUTDOWN
 // ===================================================================
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
     console.log('SIGTERM received. Shutting down gracefully...');
+    if (redisClient && redisConnected) {
+        await redisClient.quit();
+    }
     process.exit(0);
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\nSIGINT received. Shutting down gracefully...');
+    if (redisClient && redisConnected) {
+        await redisClient.quit();
+    }
     process.exit(0);
 });
