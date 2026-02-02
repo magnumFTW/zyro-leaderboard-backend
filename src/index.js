@@ -36,7 +36,21 @@ async function loadCompetitionState() {
     try {
         const state = await kv.get(CONFIG.REDIS_KEY);
         if (state) {
-            console.log('✅ Competition state loaded from Redis:', state);
+            console.log('✅ Competition state loaded from Redis:', JSON.stringify(state, null, 2));
+            
+            // Validate the loaded state
+            if (state.isActive && state.endTime) {
+                const remaining = calculateRemainingSeconds(state.endTime);
+                console.log(`   Validation - Remaining time: ${remaining}s (${Math.floor(remaining / 86400)} days)`);
+                
+                // If competition already ended, mark it as such
+                if (remaining === 0 && !state.isEnded) {
+                    console.log('⚠️  WARNING: Loaded competition has already ended, updating state');
+                    state.isEnded = true;
+                    state.isActive = false;
+                }
+            }
+            
             return state;
         }
         console.log('ℹ️  No competition state found in Redis, using default');
@@ -161,6 +175,10 @@ async function checkAndUpdateCompetitionStatus() {
     
     const remaining = calculateRemainingSeconds(competitionState.endTime);
     
+    console.log(`⏰ Status check - Remaining: ${remaining}s (${Math.floor(remaining / 86400)}d ${Math.floor((remaining % 86400) / 3600)}h)`);
+    console.log(`   End time: ${competitionState.endTime}`);
+    console.log(`   Current time: ${new Date().toISOString()}`);
+    
     if (remaining === 0 && !competitionState.isEnded) {
         competitionState.isEnded = true;
         competitionState.isActive = false;
@@ -235,7 +253,10 @@ app.get('/api/leaderboard', async (req, res) => {
             `&to=${to}`;
         
         console.log(`📊 Fetching leaderboard data`);
-        console.log(`   URL: ${apiUrl}`);
+        console.log(`   Competition State:`, JSON.stringify(competitionState, null, 2));
+        console.log(`   Date Range - From: ${from}`);
+        console.log(`   Date Range - To: ${to}`);
+        console.log(`   Full URL: ${apiUrl}`);
         
         const response = await axios.get(apiUrl, {
             timeout: 10000,
