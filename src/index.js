@@ -1,13 +1,16 @@
 /* ===================================================================
- * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT VERSION
+ * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT VERSION WITH REDIS KV
  * 
  * FIXED: CORS configured for Vercel deployment
+ * FIXED: durationDays bug in /api/status endpoint
+ * ADDED: Redis KV for persistent competition state
  * ================================================================ */
 
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const { kv } = require('@vercel/kv');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,19 +23,61 @@ const CONFIG = {
     EXTERNAL_API_TOKEN: '35eb5f92-aa7a-4e53-80eb-b8efce4b70fe',
     COMPETITION_DURATION_DAYS: 30,
     ADMIN_API_KEY: process.env.ADMIN_API_KEY || 'change-me-in-production',
-    MAX_RECORDS_PER_REQUEST: 30
+    MAX_RECORDS_PER_REQUEST: 30,
+    REDIS_KEY: 'competition:state'
 };
 
 // ===================================================================
-// # IN-MEMORY STATE STORAGE
+// # REDIS KV STATE MANAGEMENT
 // ===================================================================
-let competitionState = {
-    isActive: false,
-    startTime: null,
-    endTime: null,
-    isEnded: false,
-    createdAt: null
-};
+
+// Load competition state from Redis
+async function loadCompetitionState() {
+    try {
+        const state = await kv.get(CONFIG.REDIS_KEY);
+        if (state) {
+            console.log('✅ Competition state loaded from Redis:', state);
+            return state;
+        }
+        console.log('ℹ️  No competition state found in Redis, using default');
+        return getDefaultState();
+    } catch (error) {
+        console.error('❌ Error loading state from Redis:', error);
+        return getDefaultState();
+    }
+}
+
+// Save competition state to Redis
+async function saveCompetitionState(state) {
+    try {
+        await kv.set(CONFIG.REDIS_KEY, state);
+        console.log('✅ Competition state saved to Redis');
+        return true;
+    } catch (error) {
+        console.error('❌ Error saving state to Redis:', error);
+        return false;
+    }
+}
+
+// Get default empty state
+function getDefaultState() {
+    return {
+        isActive: false,
+        startTime: null,
+        endTime: null,
+        isEnded: false,
+        createdAt: null,
+        durationDays: null
+    };
+}
+
+// In-memory cache (synced with Redis)
+let competitionState = getDefaultState();
+
+// Initialize state on startup
+(async () => {
+    competitionState = await loadCompetitionState();
+})();
 
 // ===================================================================
 // # MIDDLEWARE - FIXED CORS FOR VERCEL
@@ -116,7 +161,7 @@ function calculateRemainingSeconds(endTimeISO) {
     return Math.max(0, Math.floor(diffMs / 1000));
 }
 
-function checkAndUpdateCompetitionStatus() {
+async function checkAndUpdateCompetitionStatus() {
     if (!competitionState.isActive) return;
     
     const remaining = calculateRemainingSeconds(competitionState.endTime);
@@ -124,6 +169,9 @@ function checkAndUpdateCompetitionStatus() {
     if (remaining === 0 && !competitionState.isEnded) {
         competitionState.isEnded = true;
         competitionState.isActive = false;
+        
+        // Save updated state to Redis
+        await saveCompetitionState(competitionState);
         
         console.log('🏁 Competition has ended automatically');
         console.log(`   Frozen snapshot: ${competitionState.startTime} to ${competitionState.endTime}`);
@@ -179,7 +227,7 @@ function getCompetitionDateRange() {
 
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
         
         const { from, to } = getCompetitionDateRange();
         
@@ -211,7 +259,8 @@ app.get('/api/leaderboard', async (req, res) => {
                 isEnded: competitionState.isEnded,
                 startTime: competitionState.startTime,
                 endTime: competitionState.endTime,
-                remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
+                remainingSeconds: calculateRemainingSeconds(competitionState.endTime),
+                durationDays: competitionState.durationDays || CONFIG.COMPETITION_DURATION_DAYS
             },
             fetchedAt: new Date().toISOString()
         });
@@ -246,8 +295,8 @@ app.get('/api/leaderboard', async (req, res) => {
     }
 });
 
-app.get('/api/status', (req, res) => {
-    checkAndUpdateCompetitionStatus();
+app.get('/api/status', async (req, res) => {
+    await checkAndUpdateCompetitionStatus();
     
     res.json({
         success: true,
@@ -267,9 +316,9 @@ app.get('/api/status', (req, res) => {
 // # ADMIN ROUTES (Protected)
 // ===================================================================
 
-app.post('/api/admin/start', authenticateAdmin, (req, res) => {
+app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
     try {
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
         
         if (competitionState.isActive && !competitionState.isEnded) {
             return res.status(400).json({
@@ -304,6 +353,9 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
             durationDays
         };
         
+        // Save to Redis
+        await saveCompetitionState(competitionState);
+        
         console.log(`🚀 Competition started: ${durationDays} days`);
         console.log(`   Start: ${competitionState.startTime}`);
         console.log(`   End:   ${competitionState.endTime}`);
@@ -327,17 +379,14 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
     }
 });
 
-app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
+app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
     try {
         const previousState = { ...competitionState };
         
-        competitionState = {
-            isActive: false,
-            startTime: null,
-            endTime: null,
-            isEnded: false,
-            createdAt: null
-        };
+        competitionState = getDefaultState();
+        
+        // Save to Redis
+        await saveCompetitionState(competitionState);
         
         console.log('🔄 Competition reset - all state cleared');
         
@@ -358,8 +407,8 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
     }
 });
 
-app.get('/api/admin/status', authenticateAdmin, (req, res) => {
-    checkAndUpdateCompetitionStatus();
+app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
+    await checkAndUpdateCompetitionStatus();
     
     const remaining = calculateRemainingSeconds(competitionState.endTime);
     
@@ -391,7 +440,8 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.3-vercel'
+        version: '1.0.4-vercel-redis',
+        redis: 'connected'
     });
 });
 
@@ -425,7 +475,7 @@ app.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
-║                  (VERCEL DEPLOYMENT)                       ║
+║              (VERCEL DEPLOYMENT + REDIS KV)                ║
 ╚════════════════════════════════════════════════════════════╝
 
 🌐 Server:     http://localhost:${PORT}
@@ -433,6 +483,7 @@ app.listen(PORT, () => {
 📊 API:        ${CONFIG.EXTERNAL_API_BASE}
 📝 Max Records: ${CONFIG.MAX_RECORDS_PER_REQUEST} per request
 🌍 Environment: ${process.env.VERCEL ? 'Vercel' : 'Local'}
+💾 Storage:     Redis KV (persistent)
 
 📝 PUBLIC ENDPOINTS:
    GET  /api/leaderboard          - Fetch leaderboard data
@@ -449,6 +500,7 @@ app.listen(PORT, () => {
    State: ${competitionState.isActive ? '🟢 ACTIVE' : competitionState.isEnded ? '🔴 ENDED' : '⚪ INACTIVE'}
 
 ✨ CORS: Enabled for all origins on Vercel
+💾 Redis: Competition state persists across deployments
     `);
     
     if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
@@ -467,9 +519,9 @@ Generate a secure key:
 // # AUTOMATIC COMPETITION STATUS CHECKER
 // ===================================================================
 
-setInterval(() => {
+setInterval(async () => {
     if (competitionState.isActive) {
-        checkAndUpdateCompetitionStatus();
+        await checkAndUpdateCompetitionStatus();
     }
 }, 60000);
 
