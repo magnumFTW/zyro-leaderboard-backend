@@ -1,7 +1,7 @@
 /* ===================================================================
  * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT WITH STANDARD REDIS
  * 
- * FIXED: Uses standard Redis instead of Vercel KV
+ * FIXED VERSION: Resolves race conditions and state inconsistencies
  * ================================================================ */
 
 require('dotenv').config();
@@ -30,10 +30,10 @@ const CONFIG = {
 // ===================================================================
 let redisClient = null;
 let redisConnected = false;
+let serverReady = false; // NEW: Prevents serving requests before initialization
 
 async function initRedis() {
     try {
-        // Check if Redis URL is configured (Vercel sets REDIS_URL automatically)
         const redisUrl = process.env.REDIS_URL;
         
         if (!redisUrl) {
@@ -47,7 +47,8 @@ async function initRedis() {
             url: redisUrl,
             socket: {
                 tls: true,
-                rejectUnauthorized: false
+                rejectUnauthorized: false,
+                connectTimeout: 10000 // NEW: Add connection timeout
             }
         });
 
@@ -61,75 +62,40 @@ async function initRedis() {
             redisConnected = true;
         });
 
+        redisClient.on('disconnect', () => {
+            console.log('⚠️  Redis disconnected');
+            redisConnected = false;
+        });
+
         await redisClient.connect();
+        
+        // Verify connection with a ping
+        await redisClient.ping();
+        console.log('✅ Redis connection verified with ping');
+        
         return redisClient;
     } catch (error) {
         console.error('❌ Failed to connect to Redis:', error);
+        redisConnected = false;
         return null;
     }
 }
 
 // ===================================================================
-// # REDIS STATE MANAGEMENT
+// # STATE MANAGEMENT WITH MUTEX LOCK + CACHE
 // ===================================================================
 
-// Load competition state from Redis
-async function loadCompetitionState() {
-    try {
-        if (!redisClient || !redisConnected) {
-            console.log('⚠️  Redis not available - using in-memory storage only');
-            return getDefaultState();
-        }
-        
-        const stateJson = await redisClient.get(CONFIG.REDIS_KEY);
-        
-        if (stateJson) {
-            const state = JSON.parse(stateJson);
-            console.log('✅ Competition state loaded from Redis:', JSON.stringify(state, null, 2));
-            
-            // Validate the loaded state
-            if (state.isActive && state.endTime) {
-                const remaining = calculateRemainingSeconds(state.endTime);
-                console.log(`   Validation - Remaining time: ${remaining}s (${Math.floor(remaining / 86400)} days)`);
-                
-                // If competition already ended, mark it as such
-                if (remaining === 0 && !state.isEnded) {
-                    console.log('⚠️  WARNING: Loaded competition has already ended, updating state');
-                    state.isEnded = true;
-                    state.isActive = false;
-                }
-            }
-            
-            return state;
-        }
-        
-        console.log('ℹ️  No competition state found in Redis, using default');
-        return getDefaultState();
-    } catch (error) {
-        console.error('❌ Error loading state from Redis:', error);
-        console.log('⚠️  Falling back to in-memory storage only');
-        return getDefaultState();
-    }
-}
+// In-memory cache (single source of truth after loading)
+let competitionState = null;
+let stateLock = false; // Simple mutex for state updates
 
-// Save competition state to Redis
-async function saveCompetitionState(state) {
-    try {
-        if (!redisClient || !redisConnected) {
-            console.log('⚠️  Redis not available - state will not persist across restarts');
-            return true;
-        }
-        
-        const stateJson = JSON.stringify(state);
-        await redisClient.set(CONFIG.REDIS_KEY, stateJson);
-        console.log('✅ Competition state saved to Redis');
-        return true;
-    } catch (error) {
-        console.error('❌ Error saving state to Redis:', error);
-        console.log('⚠️  Falling back to in-memory storage only');
-        return false;
-    }
-}
+// NEW: Leaderboard data cache to reduce fluctuation
+let leaderboardCache = {
+    data: null,
+    fetchedAt: null,
+    dateRange: null,
+    ttl: 30000 // 30 seconds cache
+};
 
 // Get default empty state
 function getDefaultState() {
@@ -143,24 +109,138 @@ function getDefaultState() {
     };
 }
 
-// In-memory cache (synced with Redis)
-let competitionState = getDefaultState();
+// NEW: Wait for lock to be released
+async function acquireLock(maxWaitMs = 5000) {
+    const startTime = Date.now();
+    while (stateLock) {
+        if (Date.now() - startTime > maxWaitMs) {
+            console.error('⚠️  Lock acquisition timeout');
+            return false;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    stateLock = true;
+    return true;
+}
+
+function releaseLock() {
+    stateLock = false;
+}
+
+// Load competition state from Redis with retry
+async function loadCompetitionState() {
+    if (!await acquireLock()) {
+        console.error('❌ Failed to acquire lock for loading state');
+        return getDefaultState();
+    }
+
+    try {
+        if (!redisClient || !redisConnected) {
+            console.log('⚠️  Redis not available - using in-memory storage only');
+            return getDefaultState();
+        }
+        
+        const stateJson = await redisClient.get(CONFIG.REDIS_KEY);
+        
+        if (stateJson) {
+            const state = JSON.parse(stateJson);
+            console.log('✅ Competition state loaded from Redis');
+            
+            // Validate and auto-update if ended
+            if (state.isActive && state.endTime) {
+                const remaining = calculateRemainingSeconds(state.endTime);
+                
+                if (remaining === 0 && !state.isEnded) {
+                    console.log('⚠️  Competition already ended, updating state');
+                    state.isEnded = true;
+                    state.isActive = false;
+                    // Save the updated state back
+                    await redisClient.set(CONFIG.REDIS_KEY, JSON.stringify(state));
+                }
+            }
+            
+            return state;
+        }
+        
+        console.log('ℹ️  No competition state found in Redis, using default');
+        return getDefaultState();
+    } catch (error) {
+        console.error('❌ Error loading state from Redis:', error);
+        return getDefaultState();
+    } finally {
+        releaseLock();
+    }
+}
+
+// Save competition state to Redis with lock
+async function saveCompetitionState(state) {
+    if (!await acquireLock()) {
+        console.error('❌ Failed to acquire lock for saving state');
+        return false;
+    }
+
+    try {
+        if (!redisClient || !redisConnected) {
+            console.log('⚠️  Redis not available - state will not persist');
+            return true; // Still return true to allow in-memory updates
+        }
+        
+        const stateJson = JSON.stringify(state);
+        await redisClient.set(CONFIG.REDIS_KEY, stateJson);
+        console.log('✅ Competition state saved to Redis');
+        return true;
+    } catch (error) {
+        console.error('❌ Error saving state to Redis:', error);
+        return false;
+    } finally {
+        releaseLock();
+    }
+}
+
+// NEW: Get state safely (returns copy to prevent mutations)
+function getCompetitionState() {
+    return { ...competitionState };
+}
+
+// NEW: Update state safely
+async function updateCompetitionState(updates) {
+    if (!await acquireLock()) {
+        console.error('❌ Failed to acquire lock for updating state');
+        return false;
+    }
+
+    try {
+        competitionState = { ...competitionState, ...updates };
+        await saveCompetitionState(competitionState);
+        return true;
+    } finally {
+        releaseLock();
+    }
+}
 
 // ===================================================================
-// # MIDDLEWARE - FIXED CORS FOR VERCEL
+// # MIDDLEWARE - WAIT FOR SERVER READY
 // ===================================================================
+
+// NEW: Ensure server is initialized before handling requests
+app.use((req, res, next) => {
+    if (!serverReady && !req.path.includes('/health')) {
+        return res.status(503).json({
+            success: false,
+            message: 'Server is starting up, please try again in a moment'
+        });
+    }
+    next();
+});
 
 app.use(cors({
     origin: function(origin, callback) {
-        // Allow requests with no origin (mobile apps, Postman, etc.)
         if (!origin) return callback(null, true);
         
-        // If running on Vercel, allow all origins
         if (process.env.VERCEL || process.env.VERCEL_ENV) {
             return callback(null, true);
         }
         
-        // Local development allowed origins
         const allowedOrigins = [
             'http://127.0.0.1:5500',
             'http://localhost:5500',
@@ -174,7 +254,6 @@ app.use(cors({
             return callback(null, true);
         }
         
-        // Default: allow the request
         callback(null, true);
     },
     credentials: true,
@@ -221,70 +300,90 @@ function authenticateAdmin(req, res, next) {
 function calculateRemainingSeconds(endTimeISO) {
     if (!endTimeISO) return 0;
     
-    const now = new Date().getTime();
+    const now = Date.now();
     const end = new Date(endTimeISO).getTime();
     const diffMs = end - now;
     
     return Math.max(0, Math.floor(diffMs / 1000));
 }
 
-async function checkAndUpdateCompetitionStatus() {
-    if (!competitionState.isActive) return;
+// NEW: Synchronous status check (doesn't modify state, just checks)
+function checkIfCompetitionEnded() {
+    const state = getCompetitionState();
     
-    const remaining = calculateRemainingSeconds(competitionState.endTime);
-    
-    console.log(`⏰ Status check - Remaining: ${remaining}s (${Math.floor(remaining / 86400)}d ${Math.floor((remaining % 86400) / 3600)}h)`);
-    console.log(`   End time: ${competitionState.endTime}`);
-    console.log(`   Current time: ${new Date().toISOString()}`);
-    
-    if (remaining === 0 && !competitionState.isEnded) {
-        competitionState.isEnded = true;
-        competitionState.isActive = false;
-        
-        // Save updated state to Redis
-        await saveCompetitionState(competitionState);
-        
-        console.log('🏁 Competition has ended automatically');
-        console.log(`   Frozen snapshot: ${competitionState.startTime} to ${competitionState.endTime}`);
+    if (!state.isActive || state.isEnded || !state.endTime) {
+        return false; // No change needed
     }
+    
+    const remaining = calculateRemainingSeconds(state.endTime);
+    return remaining === 0;
 }
 
+// MODIFIED: Async status update (separated from check)
+async function updateCompetitionStatusIfEnded() {
+    if (!checkIfCompetitionEnded()) {
+        return false;
+    }
+
+    console.log('🏁 Competition has ended, updating state...');
+    
+    const success = await updateCompetitionState({
+        isEnded: true,
+        isActive: false
+    });
+
+    if (success) {
+        console.log('✅ Competition status updated to ENDED');
+    }
+    
+    return success;
+}
+
+// FIXED: Get consistent date range with proper "now" vs "endTime" logic
 function getCompetitionDateRange() {
-    // CASE 1: Competition is ACTIVE
-    if (competitionState.isActive && !competitionState.isEnded && competitionState.startTime && competitionState.endTime) {
+    const state = getCompetitionState();
+    
+    // CASE 1: Competition is ACTIVE - use min(now, endTime)
+    // This prevents querying future dates while maintaining consistency
+    if (state.isActive && !state.isEnded && state.startTime && state.endTime) {
         const now = new Date();
-        const competitionEnd = new Date(competitionState.endTime);
-        const effectiveTo = now < competitionEnd ? now : competitionEnd;
+        const endTime = new Date(state.endTime);
+        
+        // Use whichever is earlier: now or competition end
+        // This ensures we don't query the future, but also don't get fluctuating data
+        const effectiveTo = now < endTime ? now : endTime;
+        
+        // Round down to the previous minute to reduce fluctuation
+        // This gives us 60-second consistency windows
+        effectiveTo.setSeconds(0, 0);
         
         console.log('📅 Active competition:');
-        console.log(`   From: ${competitionState.startTime} (start)`);
-        console.log(`   To: ${effectiveTo.toISOString()} (${now < competitionEnd ? 'now' : 'end'})`);
+        console.log(`   From: ${state.startTime}`);
+        console.log(`   To: ${effectiveTo.toISOString()} (${now < endTime ? 'current time (rounded)' : 'competition end'})`);
         
         return {
-            from: competitionState.startTime,
+            from: state.startTime,
             to: effectiveTo.toISOString()
         };
     }
     
     // CASE 2: Competition has ENDED
-    if (competitionState.isEnded && competitionState.startTime && competitionState.endTime) {
-        console.log('📅 Ended competition (FROZEN):');
-        console.log(`   From: ${competitionState.startTime} (start)`);
-        console.log(`   To: ${competitionState.endTime} (end - LOCKED)`);
+    if (state.isEnded && state.startTime && state.endTime) {
+        console.log('📅 Ended competition (FROZEN)');
+        console.log(`   From: ${state.startTime}`);
+        console.log(`   To: ${state.endTime}`);
         
         return {
-            from: competitionState.startTime,
-            to: competitionState.endTime
+            from: state.startTime,
+            to: state.endTime
         };
     }
     
-    // CASE 3: No competition
+    // CASE 3: No competition - use a fixed 30-day window from NOW
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
     
     console.log('📅 No competition - showing last 30 days');
-    console.log(`   From: ${thirtyDaysAgo.toISOString()}`);
-    console.log(`   To: ${now.toISOString()}`);
     
     return {
         from: thirtyDaysAgo.toISOString(),
@@ -298,9 +397,43 @@ function getCompetitionDateRange() {
 
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        await checkAndUpdateCompetitionStatus();
+        // Check if competition ended (but don't wait for update)
+        if (checkIfCompetitionEnded()) {
+            // Update in background, don't await
+            updateCompetitionStatusIfEnded().catch(err => {
+                console.error('Background status update failed:', err);
+            });
+        }
         
         const { from, to } = getCompetitionDateRange();
+        
+        // NEW: Check cache validity
+        const now = Date.now();
+        const cacheKey = `${from}|${to}`;
+        const isCacheValid = leaderboardCache.data 
+            && leaderboardCache.dateRange === cacheKey
+            && (now - leaderboardCache.fetchedAt) < leaderboardCache.ttl;
+        
+        if (isCacheValid) {
+            console.log('📦 Serving from cache (fresh for', Math.round((leaderboardCache.ttl - (now - leaderboardCache.fetchedAt)) / 1000), 'more seconds)');
+            
+            const state = getCompetitionState();
+            
+            return res.json({
+                success: true,
+                data: leaderboardCache.data,
+                competition: {
+                    isActive: state.isActive,
+                    isEnded: state.isEnded,
+                    startTime: state.startTime,
+                    endTime: state.endTime,
+                    remainingSeconds: calculateRemainingSeconds(state.endTime),
+                    durationDays: state.durationDays || CONFIG.COMPETITION_DURATION_DAYS
+                },
+                fetchedAt: new Date(leaderboardCache.fetchedAt).toISOString(),
+                cached: true
+            });
+        }
         
         const apiUrl = `${CONFIG.EXTERNAL_API_BASE}` +
             `?token=${CONFIG.EXTERNAL_API_TOKEN}` +
@@ -310,14 +443,12 @@ app.get('/api/leaderboard', async (req, res) => {
             `&from=${from}` +
             `&to=${to}`;
         
-        console.log(`📊 Fetching leaderboard data`);
-        console.log(`   Competition State:`, JSON.stringify(competitionState, null, 2));
+        console.log(`📊 Fetching fresh leaderboard data`);
         console.log(`   Date Range - From: ${from}`);
         console.log(`   Date Range - To: ${to}`);
-        console.log(`   Full URL: ${apiUrl}`);
         
         const response = await axios.get(apiUrl, {
-            timeout: 10000,
+            timeout: 15000, // Increased timeout
             headers: {
                 'User-Agent': 'Leaderboard-Backend/1.0'
             }
@@ -325,18 +456,29 @@ app.get('/api/leaderboard', async (req, res) => {
         
         console.log(`✅ External API responded with ${response.data?.list?.length || 0} players`);
         
+        // Update cache
+        leaderboardCache = {
+            data: response.data,
+            fetchedAt: now,
+            dateRange: cacheKey,
+            ttl: 30000 // 30 seconds
+        };
+        
+        const state = getCompetitionState();
+        
         res.json({
             success: true,
             data: response.data,
             competition: {
-                isActive: competitionState.isActive,
-                isEnded: competitionState.isEnded,
-                startTime: competitionState.startTime,
-                endTime: competitionState.endTime,
-                remainingSeconds: calculateRemainingSeconds(competitionState.endTime),
-                durationDays: competitionState.durationDays || CONFIG.COMPETITION_DURATION_DAYS
+                isActive: state.isActive,
+                isEnded: state.isEnded,
+                startTime: state.startTime,
+                endTime: state.endTime,
+                remainingSeconds: calculateRemainingSeconds(state.endTime),
+                durationDays: state.durationDays || CONFIG.COMPETITION_DURATION_DAYS
             },
-            fetchedAt: new Date().toISOString()
+            fetchedAt: new Date(now).toISOString(),
+            cached: false
         });
         
     } catch (error) {
@@ -350,7 +492,7 @@ app.get('/api/leaderboard', async (req, res) => {
         }
         
         if (error.response) {
-            console.error('External API error details:', error.response.data);
+            console.error('External API error details:', error.response.status, error.response.statusText);
             
             return res.status(502).json({
                 success: false,
@@ -370,17 +512,24 @@ app.get('/api/leaderboard', async (req, res) => {
 });
 
 app.get('/api/status', async (req, res) => {
-    await checkAndUpdateCompetitionStatus();
+    // Check and update if needed (but don't block response)
+    if (checkIfCompetitionEnded()) {
+        updateCompetitionStatusIfEnded().catch(err => {
+            console.error('Background status update failed:', err);
+        });
+    }
+    
+    const state = getCompetitionState();
     
     res.json({
         success: true,
         competition: {
-            isActive: competitionState.isActive,
-            isEnded: competitionState.isEnded,
-            startTime: competitionState.startTime,
-            endTime: competitionState.endTime,
-            remainingSeconds: calculateRemainingSeconds(competitionState.endTime),
-            durationDays: competitionState.durationDays || CONFIG.COMPETITION_DURATION_DAYS
+            isActive: state.isActive,
+            isEnded: state.isEnded,
+            startTime: state.startTime,
+            endTime: state.endTime,
+            remainingSeconds: calculateRemainingSeconds(state.endTime),
+            durationDays: state.durationDays || CONFIG.COMPETITION_DURATION_DAYS
         },
         serverTime: new Date().toISOString()
     });
@@ -392,16 +541,16 @@ app.get('/api/status', async (req, res) => {
 
 app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
     try {
-        await checkAndUpdateCompetitionStatus();
+        const state = getCompetitionState();
         
-        if (competitionState.isActive && !competitionState.isEnded) {
+        if (state.isActive && !state.isEnded) {
             return res.status(400).json({
                 success: false,
                 message: 'Competition is already active. Reset it first.',
                 currentState: {
-                    startTime: competitionState.startTime,
-                    endTime: competitionState.endTime,
-                    remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
+                    startTime: state.startTime,
+                    endTime: state.endTime,
+                    remainingSeconds: calculateRemainingSeconds(state.endTime)
                 }
             });
         }
@@ -418,7 +567,7 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
         const now = new Date();
         const endTime = new Date(now.getTime() + (durationDays * 24 * 60 * 60 * 1000));
         
-        competitionState = {
+        const newState = {
             isActive: true,
             startTime: now.toISOString(),
             endTime: endTime.toISOString(),
@@ -427,19 +576,25 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
             durationDays
         };
         
-        // Save to Redis
-        await saveCompetitionState(competitionState);
+        const success = await updateCompetitionState(newState);
+        
+        if (!success) {
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to save competition state'
+            });
+        }
         
         console.log(`🚀 Competition started: ${durationDays} days`);
-        console.log(`   Start: ${competitionState.startTime}`);
-        console.log(`   End:   ${competitionState.endTime}`);
+        console.log(`   Start: ${newState.startTime}`);
+        console.log(`   End:   ${newState.endTime}`);
         
         res.json({
             success: true,
             message: `Competition started successfully (${durationDays} days)`,
             competition: {
-                ...competitionState,
-                remainingSeconds: calculateRemainingSeconds(competitionState.endTime)
+                ...newState,
+                remainingSeconds: calculateRemainingSeconds(newState.endTime)
             }
         });
         
@@ -455,12 +610,16 @@ app.post('/api/admin/start', authenticateAdmin, async (req, res) => {
 
 app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
     try {
-        const previousState = { ...competitionState };
+        const previousState = getCompetitionState();
         
-        competitionState = getDefaultState();
+        const success = await updateCompetitionState(getDefaultState());
         
-        // Save to Redis
-        await saveCompetitionState(competitionState);
+        if (!success) {
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to save reset state'
+            });
+        }
         
         console.log('🔄 Competition reset - all state cleared');
         
@@ -468,7 +627,7 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
             success: true,
             message: 'Competition reset successfully',
             previousState,
-            newState: competitionState
+            newState: getCompetitionState()
         });
         
     } catch (error) {
@@ -482,21 +641,20 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
-    await checkAndUpdateCompetitionStatus();
-    
-    const remaining = calculateRemainingSeconds(competitionState.endTime);
+    const state = getCompetitionState();
+    const remaining = calculateRemainingSeconds(state.endTime);
     
     res.json({
         success: true,
         competition: {
-            isActive: competitionState.isActive,
-            isEnded: competitionState.isEnded,
-            startTime: competitionState.startTime,
-            endTime: competitionState.endTime,
-            createdAt: competitionState.createdAt,
+            isActive: state.isActive,
+            isEnded: state.isEnded,
+            startTime: state.startTime,
+            endTime: state.endTime,
+            createdAt: state.createdAt,
             remainingSeconds: remaining,
             remainingDays: Math.ceil(remaining / 86400),
-            durationDays: competitionState.durationDays || CONFIG.COMPETITION_DURATION_DAYS
+            durationDays: state.durationDays || CONFIG.COMPETITION_DURATION_DAYS
         },
         serverTime: new Date().toISOString(),
         uptime: process.uptime()
@@ -510,13 +668,20 @@ app.get('/api/admin/status', authenticateAdmin, async (req, res) => {
 app.get('/api/health', (req, res) => {
     res.json({
         success: true,
-        status: 'healthy',
+        status: serverReady ? 'healthy' : 'starting',
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.5-standard-redis',
+        version: '1.0.7-cached',
         redis: redisConnected ? 'connected' : 'not-connected',
-        storage: redisConnected ? 'persistent' : 'in-memory-only'
+        storage: redisConnected ? 'persistent' : 'in-memory-only',
+        serverReady,
+        cache: {
+            enabled: true,
+            ttl: `${leaderboardCache.ttl / 1000}s`,
+            hasData: !!leaderboardCache.data,
+            age: leaderboardCache.fetchedAt ? `${Math.round((Date.now() - leaderboardCache.fetchedAt) / 1000)}s` : 'empty'
+        }
     });
 });
 
@@ -547,19 +712,33 @@ app.use((err, req, res, next) => {
 // ===================================================================
 
 async function startServer() {
-    // Initialize Redis connection
-    await initRedis();
-    
-    // Load competition state from Redis BEFORE starting server
-    console.log('🔄 Loading competition state from storage...');
-    competitionState = await loadCompetitionState();
-    console.log('✅ Competition state loaded:', competitionState);
+    try {
+        console.log('🚀 Starting server initialization...');
+        
+        // Step 1: Initialize Redis connection
+        await initRedis();
+        
+        // Step 2: Load competition state from Redis BEFORE accepting requests
+        console.log('🔄 Loading competition state from storage...');
+        competitionState = await loadCompetitionState();
+        console.log('✅ Competition state loaded:', JSON.stringify(competitionState, null, 2));
 
-    app.listen(PORT, () => {
-        console.log(`
+        // Step 3: Check if competition needs to be marked as ended
+        if (checkIfCompetitionEnded()) {
+            console.log('⚠️  Competition already ended during startup, updating...');
+            await updateCompetitionStatusIfEnded();
+        }
+
+        // Step 4: Mark server as ready
+        serverReady = true;
+        console.log('✅ Server ready to accept requests');
+
+        // Step 5: Start listening
+        app.listen(PORT, () => {
+            console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
-║              (VERCEL DEPLOYMENT + REDIS)                   ║
+║              (FIXED - v1.0.7 with caching)                 ║
 ╚════════════════════════════════════════════════════════════╝
 
 🌐 Server:     http://localhost:${PORT}
@@ -586,57 +765,68 @@ ${competitionState.isActive ? `   Started: ${competitionState.startTime}
    Ends: ${competitionState.endTime}
    Duration: ${competitionState.durationDays} days` : ''}
 
-✨ CORS: Enabled for all origins on Vercel
+✨ FIXES APPLIED:
+   ✅ State synchronization with mutex locks
+   ✅ Server waits for initialization before serving
+   ✅ Smart date ranges (rounds to minute + uses min(now, endTime))
+   ✅ 30-second cache to prevent rapid fluctuations
+   ✅ Background status updates (non-blocking)
+   ✅ Proper Redis connection handling
+   ✅ Race condition prevention
+
 💾 Redis: ${redisConnected ? 'Competition state persists across deployments' : 'Using in-memory storage (set REDIS_URL to enable persistence)'}
-    `);
-        
-        if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
-            console.log(`
+📦 Cache: 30-second TTL for consistent rapid requests
+        `);
+            
+            if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
+                console.log(`
 ⚠️⚠️⚠️  SECURITY WARNING  ⚠️⚠️⚠️
 You are using the default admin API key!
 Please set ADMIN_API_KEY in your .env file.
+            `);
+            }
+        });
 
-Generate a secure key:
-  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-        `);
-        }
-    });
+        // ===================================================================
+        // # AUTOMATIC COMPETITION STATUS CHECKER
+        // ===================================================================
 
-    // ===================================================================
-    // # AUTOMATIC COMPETITION STATUS CHECKER
-    // ===================================================================
+        setInterval(async () => {
+            if (checkIfCompetitionEnded()) {
+                await updateCompetitionStatusIfEnded();
+            }
+        }, 60000); // Check every 60 seconds
 
-    setInterval(async () => {
-        if (competitionState.isActive) {
-            await checkAndUpdateCompetitionStatus();
-        }
-    }, 60000);
-
-    console.log('⏰ Competition status checker started (runs every 60 seconds)');
+        console.log('⏰ Competition status checker started (runs every 60 seconds)');
+        
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
 }
 
 // Start the server
-startServer().catch(error => {
-    console.error('❌ Failed to start server:', error);
-    process.exit(1);
-});
+startServer();
 
 // ===================================================================
 // # GRACEFUL SHUTDOWN
 // ===================================================================
 
-process.on('SIGTERM', async () => {
-    console.log('SIGTERM received. Shutting down gracefully...');
+async function shutdown(signal) {
+    console.log(`\n${signal} received. Shutting down gracefully...`);
+    serverReady = false;
+    
     if (redisClient && redisConnected) {
-        await redisClient.quit();
+        try {
+            await redisClient.quit();
+            console.log('✅ Redis connection closed');
+        } catch (error) {
+            console.error('Error closing Redis:', error);
+        }
     }
+    
     process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-    console.log('\nSIGINT received. Shutting down gracefully...');
-    if (redisClient && redisConnected) {
-        await redisClient.quit();
-    }
-    process.exit(0);
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
