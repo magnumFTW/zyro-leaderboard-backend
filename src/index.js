@@ -74,11 +74,6 @@ function getDefaultState() {
 // In-memory cache (synced with Redis)
 let competitionState = getDefaultState();
 
-// Initialize state on startup
-(async () => {
-    competitionState = await loadCompetitionState();
-})();
-
 // ===================================================================
 // # MIDDLEWARE - FIXED CORS FOR VERCEL
 // ===================================================================
@@ -471,8 +466,14 @@ app.use((err, req, res, next) => {
 // # START SERVER
 // ===================================================================
 
-app.listen(PORT, () => {
-    console.log(`
+async function startServer() {
+    // Load competition state from Redis BEFORE starting server
+    console.log('🔄 Loading competition state from Redis...');
+    competitionState = await loadCompetitionState();
+    console.log('✅ Competition state loaded:', competitionState);
+
+    app.listen(PORT, () => {
+        console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
 ║              (VERCEL DEPLOYMENT + REDIS KV)                ║
@@ -498,13 +499,16 @@ app.listen(PORT, () => {
 ⚡ Competition Settings:
    Duration: ${CONFIG.COMPETITION_DURATION_DAYS} days
    State: ${competitionState.isActive ? '🟢 ACTIVE' : competitionState.isEnded ? '🔴 ENDED' : '⚪ INACTIVE'}
+${competitionState.isActive ? `   Started: ${competitionState.startTime}
+   Ends: ${competitionState.endTime}
+   Duration: ${competitionState.durationDays} days` : ''}
 
 ✨ CORS: Enabled for all origins on Vercel
 💾 Redis: Competition state persists across deployments
     `);
-    
-    if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
-        console.log(`
+        
+        if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
+            console.log(`
 ⚠️⚠️⚠️  SECURITY WARNING  ⚠️⚠️⚠️
 You are using the default admin API key!
 Please set ADMIN_API_KEY in your .env file.
@@ -512,20 +516,27 @@ Please set ADMIN_API_KEY in your .env file.
 Generate a secure key:
   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
         `);
-    }
+        }
+    });
+
+    // ===================================================================
+    // # AUTOMATIC COMPETITION STATUS CHECKER
+    // ===================================================================
+
+    setInterval(async () => {
+        if (competitionState.isActive) {
+            await checkAndUpdateCompetitionStatus();
+        }
+    }, 60000);
+
+    console.log('⏰ Competition status checker started (runs every 60 seconds)');
+}
+
+// Start the server
+startServer().catch(error => {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
 });
-
-// ===================================================================
-// # AUTOMATIC COMPETITION STATUS CHECKER
-// ===================================================================
-
-setInterval(async () => {
-    if (competitionState.isActive) {
-        await checkAndUpdateCompetitionStatus();
-    }
-}, 60000);
-
-console.log('⏰ Competition status checker started (runs every 60 seconds)');
 
 // ===================================================================
 // # GRACEFUL SHUTDOWN
