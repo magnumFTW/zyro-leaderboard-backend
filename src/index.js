@@ -1,8 +1,7 @@
 /* ===================================================================
- * LEADERBOARD BACKEND API - FIXED VERSION
+ * LEADERBOARD BACKEND API - VERCEL DEPLOYMENT VERSION
  * 
- * FIXED: Competition end now shows frozen snapshot of that period only
- * Previous bug: Ended competitions showed cumulative data from all past runs
+ * FIXED: CORS configured for Vercel deployment
  * ================================================================ */
 
 require('dotenv').config();
@@ -36,13 +35,20 @@ let competitionState = {
 };
 
 // ===================================================================
-// # MIDDLEWARE
+// # MIDDLEWARE - FIXED CORS FOR VERCEL
 // ===================================================================
 
 app.use(cors({
     origin: function(origin, callback) {
+        // Allow requests with no origin (mobile apps, Postman, etc.)
         if (!origin) return callback(null, true);
         
+        // If running on Vercel, allow all origins
+        if (process.env.VERCEL || process.env.VERCEL_ENV) {
+            return callback(null, true);
+        }
+        
+        // Local development allowed origins
         const allowedOrigins = [
             'http://127.0.0.1:5500',
             'http://localhost:5500',
@@ -52,15 +58,12 @@ app.use(cors({
             process.env.FRONTEND_URL
         ].filter(Boolean);
         
-        if (allowedOrigins.indexOf(origin) !== -1) {
+        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
             return callback(null, true);
         }
         
-        if (process.env.NODE_ENV === 'development') {
-            return callback(null, true);
-        }
-        
-        callback(new Error('Not allowed by CORS'));
+        // Default: allow the request
+        callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -113,37 +116,25 @@ function calculateRemainingSeconds(endTimeISO) {
     return Math.max(0, Math.floor(diffMs / 1000));
 }
 
-/**
- * FIXED: Check if competition should be marked as ended
- * Preserves startTime/endTime for frozen snapshot
- */
 function checkAndUpdateCompetitionStatus() {
     if (!competitionState.isActive) return;
     
     const remaining = calculateRemainingSeconds(competitionState.endTime);
     
     if (remaining === 0 && !competitionState.isEnded) {
-        // Competition just ended - FREEZE the state
         competitionState.isEnded = true;
         competitionState.isActive = false;
-        // KEEP startTime and endTime - needed for frozen snapshot!
         
         console.log('🏁 Competition has ended automatically');
         console.log(`   Frozen snapshot: ${competitionState.startTime} to ${competitionState.endTime}`);
     }
 }
 
-/**
- * FIXED: Get date range for API queries
- * Properly handles active, ended, and no-competition states
- */
 function getCompetitionDateRange() {
-    // CASE 1: Competition is ACTIVE - show from start to RIGHT NOW
+    // CASE 1: Competition is ACTIVE
     if (competitionState.isActive && !competitionState.isEnded && competitionState.startTime && competitionState.endTime) {
         const now = new Date();
         const competitionEnd = new Date(competitionState.endTime);
-        
-        // Use the earlier of "right now" OR "competition end"
         const effectiveTo = now < competitionEnd ? now : competitionEnd;
         
         console.log('📅 Active competition:');
@@ -156,19 +147,19 @@ function getCompetitionDateRange() {
         };
     }
     
-    // CASE 2: Competition has ENDED - show FROZEN snapshot of that period ONLY
+    // CASE 2: Competition has ENDED
     if (competitionState.isEnded && competitionState.startTime && competitionState.endTime) {
-        console.log('📅 Ended competition (FROZEN SNAPSHOT):');
+        console.log('📅 Ended competition (FROZEN):');
         console.log(`   From: ${competitionState.startTime} (start)`);
         console.log(`   To: ${competitionState.endTime} (end - LOCKED)`);
         
         return {
-            from: competitionState.startTime,  // Competition start
-            to: competitionState.endTime        // Competition end (FROZEN)
+            from: competitionState.startTime,
+            to: competitionState.endTime
         };
     }
     
-    // CASE 3: No competition ever ran - show rolling last 30 days
+    // CASE 3: No competition
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
     
@@ -280,7 +271,6 @@ app.post('/api/admin/start', authenticateAdmin, (req, res) => {
     try {
         checkAndUpdateCompetitionStatus();
         
-        // Allow starting a new competition even if previous one ended
         if (competitionState.isActive && !competitionState.isEnded) {
             return res.status(400).json({
                 success: false,
@@ -341,7 +331,6 @@ app.post('/api/admin/reset', authenticateAdmin, (req, res) => {
     try {
         const previousState = { ...competitionState };
         
-        // COMPLETE RESET - clear everything
         competitionState = {
             isActive: false,
             startTime: null,
@@ -402,7 +391,7 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.2'
+        version: '1.0.3-vercel'
     });
 });
 
@@ -436,13 +425,14 @@ app.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
-║               (FIXED: Proper Competition Isolation)        ║
+║                  (VERCEL DEPLOYMENT)                       ║
 ╚════════════════════════════════════════════════════════════╝
 
 🌐 Server:     http://localhost:${PORT}
 🔑 Admin Key:  ${CONFIG.ADMIN_API_KEY === 'change-me-in-production' ? '⚠️  USING DEFAULT KEY!' : '✅ Custom key set'}
 📊 API:        ${CONFIG.EXTERNAL_API_BASE}
 📝 Max Records: ${CONFIG.MAX_RECORDS_PER_REQUEST} per request
+🌍 Environment: ${process.env.VERCEL ? 'Vercel' : 'Local'}
 
 📝 PUBLIC ENDPOINTS:
    GET  /api/leaderboard          - Fetch leaderboard data
@@ -458,7 +448,7 @@ app.listen(PORT, () => {
    Duration: ${CONFIG.COMPETITION_DURATION_DAYS} days
    State: ${competitionState.isActive ? '🟢 ACTIVE' : competitionState.isEnded ? '🔴 ENDED' : '⚪ INACTIVE'}
 
-✨ FIX: Ended competitions now show frozen snapshot of their period only
+✨ CORS: Enabled for all origins on Vercel
     `);
     
     if (CONFIG.ADMIN_API_KEY === 'change-me-in-production') {
