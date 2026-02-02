@@ -109,16 +109,22 @@ function getDefaultState() {
     };
 }
 
-// NEW: Wait for lock to be released
+// NEW: Wait for lock to be released with improved timeout handling
 async function acquireLock(maxWaitMs = 5000) {
     const startTime = Date.now();
+    const lockId = Date.now(); // For debugging
+    
     while (stateLock) {
-        if (Date.now() - startTime > maxWaitMs) {
-            console.error('⚠️  Lock acquisition timeout');
-            return false;
+        const elapsed = Date.now() - startTime;
+        if (elapsed > maxWaitMs) {
+            console.error(`⚠️  Lock acquisition timeout after ${elapsed}ms (lockId: ${lockId})`);
+            console.error(`   Current lock holder may have crashed. Force-releasing lock.`);
+            stateLock = false; // Force release the stuck lock
+            break;
         }
         await new Promise(resolve => setTimeout(resolve, 10));
     }
+    
     stateLock = true;
     return true;
 }
@@ -129,10 +135,7 @@ function releaseLock() {
 
 // Load competition state from Redis with retry
 async function loadCompetitionState() {
-    if (!await acquireLock()) {
-        console.error('❌ Failed to acquire lock for loading state');
-        return getDefaultState();
-    }
+    await acquireLock(); // Now always succeeds (force-releases if needed)
 
     try {
         if (!redisClient || !redisConnected) {
@@ -154,8 +157,10 @@ async function loadCompetitionState() {
                     console.log('⚠️  Competition already ended, updating state');
                     state.isEnded = true;
                     state.isActive = false;
-                    // Save the updated state back
-                    await redisClient.set(CONFIG.REDIS_KEY, JSON.stringify(state));
+                    // Save the updated state back (we already have the lock)
+                    if (redisClient && redisConnected) {
+                        await redisClient.set(CONFIG.REDIS_KEY, JSON.stringify(state));
+                    }
                 }
             }
             
@@ -172,17 +177,12 @@ async function loadCompetitionState() {
     }
 }
 
-// Save competition state to Redis with lock
-async function saveCompetitionState(state) {
-    if (!await acquireLock()) {
-        console.error('❌ Failed to acquire lock for saving state');
-        return false;
-    }
-
+// Internal save function (assumes lock is already held)
+async function _saveToRedis(state) {
     try {
         if (!redisClient || !redisConnected) {
             console.log('⚠️  Redis not available - state will not persist');
-            return true; // Still return true to allow in-memory updates
+            return true;
         }
         
         const stateJson = JSON.stringify(state);
@@ -192,6 +192,15 @@ async function saveCompetitionState(state) {
     } catch (error) {
         console.error('❌ Error saving state to Redis:', error);
         return false;
+    }
+}
+
+// Save competition state to Redis with lock (public API)
+async function saveCompetitionState(state) {
+    await acquireLock();
+
+    try {
+        return await _saveToRedis(state);
     } finally {
         releaseLock();
     }
@@ -204,15 +213,16 @@ function getCompetitionState() {
 
 // NEW: Update state safely
 async function updateCompetitionState(updates) {
-    if (!await acquireLock()) {
-        console.error('❌ Failed to acquire lock for updating state');
-        return false;
-    }
+    await acquireLock();
 
     try {
         competitionState = { ...competitionState, ...updates };
-        await saveCompetitionState(competitionState);
+        // Use internal save (we already have the lock)
+        await _saveToRedis(competitionState);
         return true;
+    } catch (error) {
+        console.error('❌ Error in updateCompetitionState:', error);
+        return false;
     } finally {
         releaseLock();
     }
@@ -672,7 +682,7 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        version: '1.0.7-cached',
+        version: '1.0.8-lock-fixed',
         redis: redisConnected ? 'connected' : 'not-connected',
         storage: redisConnected ? 'persistent' : 'in-memory-only',
         serverReady,
@@ -738,7 +748,7 @@ async function startServer() {
             console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║            🚀 LEADERBOARD BACKEND API RUNNING              ║
-║              (FIXED - v1.0.7 with caching)                 ║
+║              (FIXED - v1.0.8 - Lock Bug Fixed)             ║
 ╚════════════════════════════════════════════════════════════╝
 
 🌐 Server:     http://localhost:${PORT}
